@@ -11,6 +11,7 @@ end to end attention solution with aiter kernels
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
@@ -358,12 +359,34 @@ class AiterAttnBackend(AttentionBackend):
 
         self.kv_cache_is_vectorized_5d = _pool_is_vec5d(model_runner.token_to_kv_pool)
 
+        # `paged_attention_ragged` (the decode fallback below) is unconditionally
+        # pinned to block_size=1: its call site views the KV cache as
+        # ``k_cache.view(-1, 1, ...)`` and passes the literal ``1`` as the kernel's
+        # block_size argument, regardless of ``self.page_size``. So whenever the
+        # server is configured with ``page_size > 1``, the ragged kernel silently
+        # never engages the paging it was configured with -- every decode KV
+        # fetch still degrades into a per-token indexed gather instead of a
+        # contiguous per-page burst. ``unified_attention`` (below) is the only
+        # aiter decode kernel that actually consumes ``page_size``: it views k/v
+        # as ``(-1, page_size, H, D)`` and walks a real ``block_table``. This
+        # path is already exercised in production for non-SWA models via the
+        # opt-in env var (see the ``forward_decode`` comment above referencing
+        # Qwen3-VL), so auto-routing dense/non-SWA models here as well -- whenever
+        # they are actually configured with a page_size that the ragged kernel
+        # cannot honor -- extends an already-validated code path rather than
+        # introducing a new one. An explicit ``SGLANG_USE_AITER_UNIFIED_ATTN``
+        # setting (either value) always overrides this default.
+        _env_unified_attn = os.environ.get("SGLANG_USE_AITER_UNIFIED_ATTN")
         if self.use_sliding_window_kv_pool:
             self.use_triton_unified_attention = True
-        else:
+        elif _env_unified_attn is not None:
             self.use_triton_unified_attention = get_bool_env_var(
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
+        elif self.page_size > 1:
+            self.use_triton_unified_attention = True
+        else:
+            self.use_triton_unified_attention = False
 
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
         # mask reduces to pure causal and can go through unified_attention
