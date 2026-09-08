@@ -734,10 +734,23 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     also returns the actual filtered weights, their token-ID permutation, and
     the selected weights.
     """
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    # The top-k filter below zeroes every column at rank >= top_k, so keeping only
+    # the max(top_ks) leading columns is exact, not an approximation. Two exclusions:
+    # multinomial_with_seed draws as a function of row width, so narrowing would
+    # change which token a seed selects; and return_filtered_probs hands
+    # probs_sort/probs_idx to the caller, so their width is part of the contract.
+    probs_sort = probs_idx = None
+    if sampling_seed is None and not return_filtered_probs:
+        max_top_k = int(top_ks.max().item())
+        if 0 < max_top_k < probs.shape[-1]:
+            probs_sort, probs_idx = torch.topk(
+                probs, k=max_top_k, dim=-1, largest=True, sorted=True
+            )
+    if probs_sort is None:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
         >= top_ks.view(-1, 1)
     ] = 0.0
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
