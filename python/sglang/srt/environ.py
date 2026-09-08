@@ -1040,6 +1040,9 @@ class Envs:
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)
+    # Split-K fallback for the DSV4 dual-scope decode kernel when the base grid
+    # cannot fill the CU array: "auto", "off"/"0", or a forced factor of 2/4/8.
+    SGLANG_DSV4_DECODE_SPLITK = EnvStr("auto")
     # Native FP8 prefill for exact gfx950 Kimi-K3 zero-prefix and absorbed
     # cached-prefix shapes. Validated at 98% GSM8K accuracy.
     SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
