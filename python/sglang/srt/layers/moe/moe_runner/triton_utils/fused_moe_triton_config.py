@@ -177,6 +177,141 @@ def get_moe_configs(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Padding-aware BLOCK_SIZE_M for the ROCm fp8_w8a8 fused-MoE default config.
+#
+# ``config["BLOCK_SIZE_M"]`` is not just the GEMM M-tile. fused_moe.py hands it
+# straight to ``moe_align_block_size`` (fused_moe.py, _prepare_moe_launch), which
+# rounds *every touched expert's* row segment up to a full block, and the
+# kernel's only early exit is ``pid_m * BLOCK_SIZE_M >= num_tokens_post_padded``
+# (kernels/ops/moe/fused_moe_triton_kernels.py) -- an all-padding block still
+# runs the whole K contraction. Below one block of routed rows per expert the
+# block count is pinned to the touched-expert count whatever the alignment is,
+# so the padded row count -- and with it the work -- tracks
+# ``touched_experts * BLOCK_SIZE_M`` and not the batch. A 32-token decode step
+# on a 128-expert / top_k 8 model routes 256 rows, touches ~108 experts, and
+# pads to ~6.9k rows at the alignment 64 that ``M <= E`` currently selects.
+#
+# The shipped heuristic cannot see this: it branches only on ``M`` vs ``E`` and
+# never reads ``topk``, so it does not know how many rows an expert actually
+# receives. The table below keys on exactly that quantity.
+#
+# Ported from ROCm/vllm#1069 ("M-aware moe_align block size", W4A16 prefill on
+# gfx1151) and re-derived against SGLang's own fused_experts on MI355X (gfx950)
+# for Gemma4 fp8_w8a8, E=128 / top_k=8 / N=704 / K=2816: a 540-point
+# BLOCK_SIZE_M x BLOCK_SIZE_N x BLOCK_SIZE_K x num_warps x num_stages sweep at
+# 7 batch sizes, hipGraph-captured because decode runs under
+# --cuda-graph-max-bs-decode and eager timing is host-launch bound.
+#
+# Tiers were then re-selected for worst case rather than best case across three
+# routing distributions (uniform, and two increasingly skewed routers that drop
+# the touched-expert count from 128 to 58 and to 31). Skew only ever raises the
+# rows an individual *touched* expert receives above the M*topk/E average this
+# table can see, so the rule can only ever under-estimate; the tiers below are
+# the ones whose worst case over that uncertainty stays flat. A more aggressive
+# table (BLOCK_SIZE_M 16 out to M=128) is 5-12% faster under uniform routing but
+# gives back 13% under the skewed one, so it is deliberately not used.
+#
+# Measured fused_experts time, shipped default -> this table (median of 30 graph
+# replays, MI355X gfx950, triton 3.6.0), uniform / skewed routing:
+#     M=   16   175.3 -> 156.4us  1.120x  |  132.4 -> 125.5us  1.055x
+#     M=   32   200.1 -> 184.6us  1.084x  |  168.8 -> 150.6us  1.121x
+#     M=   64   213.9 -> 208.6us  1.025x  |  189.0 -> 183.5us  1.030x
+#     M=  128   224.5 -> 218.2us  1.029x  |  213.0 -> 210.9us  1.010x
+#     M=  192   278.0 -> 224.9us  1.236x  |  281.1 -> 227.0us  1.238x
+#     M=  512   303.1 -> 253.4us  1.196x  |  349.4 -> 284.9us  1.226x
+#     M= 1024   353.2 -> 318.3us  1.110x  |  400.4 -> 369.3us  1.084x
+#     M= 4096   845.7 -> 776.4us  1.089x  |  915.6 -> 805.3us  1.137x
+# Over M = 1..8192 x 3 routers the total is 1.100x / 1.115x / 1.106x and the
+# single worst point is 0.980x (M=24 under the most skewed router).
+#
+# Every tier keeps BLOCK_SIZE_K=128, which is what both branches this bypasses
+# already used, so the K reduction order per output element is unchanged and the
+# results are bit-identical -- measured max_abs_err 0 against the old configs at
+# every batch size and both routers.
+#
+# Scope: ROCm only, and only the no-tuned-config fallback. Devices that ship a
+# tuned JSON (MI300X / MI325X) never reach get_default_config, so this affects
+# exactly the untuned-device case it was measured on.
+#
+# Entries are (minimum routed rows per expert, tile), highest tier first. The
+# top two tiers are the actual alignment decision -- 128 once every expert fills
+# a padding block anyway, 64 below that, which is where the shipped ``M <= E``
+# test puts the boundary in the wrong place. The bottom two only re-tune the
+# tile at a fixed alignment.
+_HIP_FP8_MOE_ALIGN_TIERS: Tuple[Tuple[int, Dict[str, int]], ...] = (
+    (
+        64,
+        {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+        },
+    ),
+    (
+        16,
+        {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+        },
+    ),
+    # Same alignment as the tier above and as the shipped ``M <= E`` branch;
+    # only num_warps moves, which is what the sub-block-per-expert regime wants.
+    (
+        4,
+        {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 8,
+            "num_stages": 2,
+        },
+    ),
+    # Under ~4 routed rows per expert even a fully skewed router cannot fill a
+    # 64-row block, so the smallest alignment is unconditionally safe here.
+    (
+        0,
+        {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 4,
+        },
+    ),
+)
+
+
+def _hip_padding_aware_fp8_config(
+    M: int, E: int, topk: Optional[int]
+) -> Optional[Dict[str, int]]:
+    """Pick the fp8_w8a8 tile from routed rows per expert, not from ``M`` alone.
+
+    ``BLOCK_SIZE_M`` doubles as the ``moe_align_block_size`` alignment, so an
+    oversized tile pads every touched expert up to a full block of work that the
+    kernel then actually executes. See ``_HIP_FP8_MOE_ALIGN_TIERS``.
+
+    Returns None off ROCm, or when ``topk`` / ``E`` are not usable, so the
+    caller falls back to the previous heuristic.
+    """
+    if not _is_hip or not topk or E <= 0:
+        return None
+    rows_per_expert = (M * topk) / E
+    for min_rows_per_expert, config in _HIP_FP8_MOE_ALIGN_TIERS:
+        if rows_per_expert >= min_rows_per_expert:
+            return dict(config)
+    return None
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -216,6 +351,9 @@ def get_default_config(
                         "num_stages": 2,
                     }
             else:
+                padding_aware_config = _hip_padding_aware_fp8_config(M, E, topk)
+                if padding_aware_config is not None:
+                    return padding_aware_config
                 config = {
                     "BLOCK_SIZE_M": 128,
                     "BLOCK_SIZE_N": 256,
