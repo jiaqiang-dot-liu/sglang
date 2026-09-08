@@ -848,6 +848,10 @@ class Envs:
     # skips the explicit pad. Currently only takes effect on the
     # post_attention_layernorm path with aiter backend and TP=1.
     SGLANG_AITER_FUSE_RMSNORM_PAD = EnvBool(False)
+    # Kill-switch for the aiter fused qk_norm + plain-RoPE + KV-write decode
+    # kernel on dense Qwen3. The mRoPE twin of this fusion has no switch because
+    # it predates one; this covers the 1D-RoPE path.
+    SGLANG_DISABLE_AITER_FUSED_QK_NORM_ROPE = EnvBool(False)
     # Physical layout for MHA KV cache. "nhd" (default) keeps the existing
     # (size, head_num, head_dim) per-token storage that
     # `aiter.mha.mha_batch_prefill_func`/`unified_attention` consume directly.
