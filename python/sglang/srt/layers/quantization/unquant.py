@@ -654,6 +654,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 layer, "w2_weight", shuffle_weight(layer.w2_weight.data, (16, 16))
             )
             torch.cuda.empty_cache()
+            # aiter's CK fused-MoE kernel-config lookup (aiter/fused_moe.py) branches
+            # on `getattr(w, "is_shuffled", False)` to decide between preshuffle_on and
+            # preshuffle_off tuned kernel tables. Weights above are already physically
+            # preshuffled via shuffle_weight(), but the marker attribute was never set,
+            # so the lookup silently fell back to the preshuffle_off path (or warned
+            # "tuned config found ... but is_shuffled=False. Tuned kernels are
+            # optimized for preshuffled weights") even though preshuffled data was in
+            # use. Mirror the marker-setting already done for the fp8 path
+            # (Fp8MoEMethod.process_weights_after_loading) so CK-MoE picks the correct
+            # preshuffled kernel/config for the unquantized (bf16) MoE path too.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
 
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
