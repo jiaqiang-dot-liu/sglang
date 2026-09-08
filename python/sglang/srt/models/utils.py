@@ -498,6 +498,37 @@ def apply_qk_norm(
         )
         return q, k
 
+    # A QKVParallelLinear result is split into Q/K/V views whose last dimension
+    # is dense but whose row stride remains the full packed QKV width.  Flattening
+    # either view with reshape() below materializes it.  AITER's OPUS RMSNorm takes
+    # an explicit input row stride, so feed the original 2-D views to it and write
+    # dense outputs directly.  Keep this narrowly gated: the regular AITER
+    # dispatcher selects a contiguous-only kernel for this common shape.
+    if (
+        _is_hip
+        and q.dim() == 2
+        and k.dim() == 2
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and q.dtype == q_norm.weight.dtype
+        and k.dtype == k_norm.weight.dtype
+    ):
+        from aiter.ops.rmsnorm import rms_norm_opus
+
+        def row_strided_norm(x, norm):
+            out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+            rms_norm_opus(
+                out,
+                x,
+                norm.weight,
+                norm.variance_epsilon,
+            )
+            return out
+
+        q = row_strided_norm(q, q_norm)
+        k = row_strided_norm(k, k_norm)
+        return q, k
+
     if alt_stream is not None and get_is_capture_mode():
         current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
