@@ -3157,10 +3157,11 @@ class AiterAttnBackend(AttentionBackend):
                 max_kv_len = page_table.shape[1] * self.page_size
                 q_descale = None
                 if self.kv_cache_dtype == fp8_dtype:
-                    q_descale = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
-                    q, _ = scaled_fp8_quant(q, q_descale)
+                    # k_scale is calibrated for the K cache's range, not q's, so
+                    # reusing it as the q scale clips q. The kernel folds
+                    # q_descale * k_descale into qk_scale, so a dynamic scale is safe.
+                    q, q_scale = scaled_fp8_quant(q)  # dynamic per-tensor scale
+                    q_descale = q_scale
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
