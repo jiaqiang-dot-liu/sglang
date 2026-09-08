@@ -205,15 +205,43 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     )
 
 
+def _aiter_ar_fusion_max_bytes() -> int:
+    """Byte cutoff for AITER AllReduce+RMSNorm fusion eligibility.
+
+    This used to be hardcoded to 8*1024*8192 (64 MiB) to match
+    AiterCustomAllreduce's *default* custom-AR size cutoff. That cutoff is
+    actually runtime-tunable via AITER_CUSTOM_AR_MAX_SIZE (see
+    aiter.dist.device_communicators.custom_all_reduce._resolve_car_max_size /
+    CustomAllreduce._car_max_size), but this fusion gate never read the
+    resolved value. As a result, raising AITER_CUSTOM_AR_MAX_SIZE widened
+    which tensors dispatch to the plain custom_all_reduce kernel (instead of
+    falling back to RCCL) without ever unlocking the fused AR+RMSNorm kernel
+    for those same larger tensors (e.g. large chunked-prefill activations on
+    TP8), leaving the two size gates out of sync. Read the communicator's
+    actual resolved cutoff so both stay in lockstep; fall back to the
+    historical constant when it is unavailable (e.g. non-AITER backends).
+    """
+    try:
+        ca_comm = get_tp_group().ca_comm
+        car_max_size = getattr(ca_comm, "_car_max_size", None)
+        if car_max_size is not None:
+            return int(car_max_size)
+    except Exception:  # noqa: BLE001 - defensive; never block the AR fast path
+        pass
+    return 8 * 1024 * 8192  # historical default: 64 MiB
+
+
 def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     n = input_tensor.shape[-1]
     total_bytes = input_tensor.numel() * input_tensor.element_size()
-    # Aiter's should_custom_ar uses <= max_size/2 (64 MB); match that boundary.
+    # Match AiterCustomAllreduce's resolved custom-AR cutoff (defaults to 64
+    # MiB, tunable via AITER_CUSTOM_AR_MAX_SIZE) so this fusion gate and the
+    # plain custom_all_reduce dispatch agree on which tensors are eligible.
     return (
         _use_aiter
         and total_bytes > 0
         and n <= 16384
-        and total_bytes <= 8 * 1024 * 8192
+        and total_bytes <= _aiter_ar_fusion_max_bytes()
         and get_parallel().tp_size != 6
         and not is_dp_attention_enabled()
         and get_exec().comm.enable_aiter_allreduce_fusion
