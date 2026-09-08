@@ -1,5 +1,7 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
+import functools
+import os
 from typing import Optional
 
 import torch
@@ -13,25 +15,102 @@ from ..common.utils import (
     unit_scale,
 )
 
+# --------------------------------------------------------------------------- #
+# gfx950 stage-1 geometry for the sparse decode kernel.
+#
+# The stock autotune space (num_warps in {4, 8} x num_stages in {2, 3, 4, 5})
+# does not contain the gfx950 optimum, and which member of it the autotuner
+# picks depends on whatever `seq_lens` happen to be live when the cuda graph
+# for a given batch rung is captured -- so a server can spend the whole run on
+# a config ~20% slower than num_warps=4. On gfx950 we derive the geometry from
+# the launch shape instead of benchmarking it.
+#
+# Measured on MI355X (256 CU) at the real *per-rank* MiniMax-M3 decode shape.
+# Note this is not the config-file shape: num_key_value_heads=4 at TP=8 gives
+# num_kv_heads = max(1, 4 // 8) = 1 and num_q_heads = 64 // 8 = 8 per rank
+# (models/minimax_m3.py:489), so the K/V pool is [max_slots, 1, 128] and the
+# grid's second dimension is 1. Measured cold (rotating KV pools, so the
+# gathers miss the 256 MB LLC exactly as they do when 57 layers each stream
+# their own multi-GB KV slice). num_warps=4 wins at every batch measured;
+# num_stages=2 wins while the grid is at most about one wave deep, and past
+# that occupancy already hides the gather latency so the extra stage only
+# costs registers.
+#
+# TARGET_GRID: upstream aims the split count at 256 total workgroups. With
+# num_kv_heads == 1 the grid is (batch * NUM_TOPK_CHUNKS, 1), so at batch 64
+# that yields NUM_TOPK_CHUNKS=4 and exactly one workgroup per CU with nothing
+# to interleave against. Aiming at two workgroups per CU (chunks=8 here)
+# measured 17.7 % faster at seq 1024 and 5.6 % at seq 2048.
+# --------------------------------------------------------------------------- #
+_GFX95_NUM_WARPS = 4
+_GFX95_ONE_WAVE_SLACK = 1.25  # workgroups/CU below which num_stages=2 pays off
+_GFX95_TARGET_WAVES = 2  # split target, in waves of the CU count
+_TUNE_ENV = "SGLANG_MINIMAX_SPARSE_DECODE_TUNE"
 
-@triton.heuristics(
-    {
-        "BLOCK_SIZE_H": lambda args: max(
-            16, triton.next_power_of_2(args["gqa_group_size"])
-        ),
-        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
-        "HAS_SINK": lambda args: args["sink_ptr"] is not None,
-        "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
-    }
-)
+
+@functools.lru_cache(maxsize=None)
+def _gfx95_props(device_index: int):
+    """(is_gfx95, core_count) for a device; cheap and cached."""
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+    except Exception:  # pragma: no cover - defensive
+        return False, 0
+    is_gfx95 = bool(torch.version.hip) and "gfx95" in getattr(
+        props, "gcnArchName", ""
+    )
+    return is_gfx95, props.multi_processor_count
+
+
+def _sparse_decode_tune(device_index: int) -> bool:
+    """Use the fixed gfx950 geometry instead of autotuning?
+
+    Unset -> on for gfx95x, off everywhere else. ``0``/``1`` force it.
+    """
+    override = os.environ.get(_TUNE_ENV)
+    if override is not None:
+        return override.strip() not in ("", "0", "false", "False")
+    return _gfx95_props(device_index)[0]
+
+
+def _gfx95_stage1_geometry(workgroups: int, device_index: int):
+    """(num_warps, num_stages) for a stage-1 launch of ``workgroups`` blocks."""
+    cores = _gfx95_props(device_index)[1]
+    num_stages = 2
+    if cores > 0 and workgroups > _GFX95_ONE_WAVE_SLACK * cores:
+        num_stages = 1
+    return _GFX95_NUM_WARPS, num_stages
+
+
+_DECODE_HEURISTICS = {
+    "BLOCK_SIZE_H": lambda args: max(
+        16, triton.next_power_of_2(args["gqa_group_size"])
+    ),
+    "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+    "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
+    "HAS_SINK": lambda args: args["sink_ptr"] is not None,
+    "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
+}
+
+
+@triton.heuristics(_DECODE_HEURISTICS)
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=nw, num_stages=ns)
         for nw in [4, 8]
         for ns in [2, 3, 4, 5]
     ],
-    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "block_size", "HAS_SINK"],
+    # NUM_TOPK_CHUNKS and BLOCK_SIZE_N set the launch geometry and the inner
+    # loop trip count, so a config tuned for one must not be reused for
+    # another. ("block_size" was never a kernel argument, so the autotuner
+    # silently dropped it from the key.)
+    key=[
+        "BATCH_SIZE_BUCKET",
+        "gqa_group_size",
+        "head_dim",
+        "HAS_SINK",
+        "NUM_TOPK_CHUNKS",
+        "BLOCK_SIZE_N",
+    ],
 )
 @triton.jit
 def _gqa_share_sparse_decode_kernel(
@@ -89,6 +168,15 @@ def _gqa_share_sparse_decode_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     IS_FP8: tl.constexpr,
+    # Streaming hint for the KV gathers. Every (BLOCK_SIZE_D, BLOCK_SIZE_N)
+    # tile is read by exactly one program exactly once, so the per-CU vector L1
+    # can never serve a hit; ".cg" keeps the gather out of it. Empty string
+    # (the default) reproduces the original loads bit-for-bit.
+    KV_CACHE_MODIFIER: tl.constexpr = "",
+    # Guard the gathered slot ids by clamping instead of a 64-bit modulo. Both
+    # forms are identity for the in-range slot ids req_to_token actually holds;
+    # the modulo lowers to a software int64 division in the hot loop.
+    CLAMP_SLOT_GUARD: tl.constexpr = False,
 ):
     # decode program ids: split-K over the topk dimension to give every SM
     # something to do at small batch. pid(0) folds (batch, chunk) together so
@@ -173,7 +261,11 @@ def _gqa_share_sparse_decode_kernel(
             mask=pos_mask,
             other=0,
         ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots  # safety against negative
+        if CLAMP_SLOT_GUARD:
+            # same out-of-range guard, without a per-iteration int64 division
+            slots = tl.minimum(tl.maximum(slots, 0), max_slots - 1)
+        else:
+            slots = (slots + max_slots) % max_slots  # safety against negative
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
             slots[None, :] * stride_k_s
@@ -184,6 +276,7 @@ def _gqa_share_sparse_decode_kernel(
             k_cache_ptr + k_off,
             mask=dim_mask[:, None] & pos_mask[None, :],
             other=0.0,
+            cache_modifier=KV_CACHE_MODIFIER,
         )
         if IS_FP8:
             # fp8 KV cache: with bf16/fp16 Q this widens K to the compute dtype
@@ -203,6 +296,7 @@ def _gqa_share_sparse_decode_kernel(
             v_cache_ptr + v_off,
             mask=pos_mask[:, None] & dim_mask[None, :],
             other=0.0,
+            cache_modifier=KV_CACHE_MODIFIER,
         )
         if IS_FP8:
             # Cast V to the compute dtype. With bf16/fp16 Q this widens (so the
@@ -259,6 +353,22 @@ def _gqa_share_sparse_decode_kernel(
         order=(0,),
     )
     tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
+
+
+# Same kernel and same heuristics, minus the autotuner, so the gfx950 path can
+# hand num_warps/num_stages straight to the launch. Autotuner.run rejects an
+# explicit num_warps kwarg (it would collide with the one from its own config),
+# hence the separate entry point rather than a per-call override.
+# Decorators apply bottom-up, so the module symbol is
+# Heuristics(Autotuner(JITFunction)) and `.fn.fn` is the bare JITFunction. If a
+# future Triton reshapes that stack, fall back to the autotuned kernel rather
+# than failing at import (which would take the server down).
+try:
+    _gqa_share_sparse_decode_kernel_fixed = triton.heuristics(_DECODE_HEURISTICS)(
+        _gqa_share_sparse_decode_kernel.fn.fn
+    )
+except Exception:  # pragma: no cover - defensive
+    _gqa_share_sparse_decode_kernel_fixed = None
 
 
 @triton.heuristics(
@@ -351,7 +461,15 @@ def flash_decode_with_gqa_share_sparse(
     # only depend on shape constants (so grid is fixed within a cuda graph).
     # Capped by max_topk because chunks beyond real_topk early-fall-through to
     # the merge-as-zero path; capping avoids wasting blocks at tiny topk.
+    device_index = q.device.index if q.device.index is not None else 0
+    tune = _gqa_share_sparse_decode_kernel_fixed is not None and _sparse_decode_tune(
+        device_index
+    )
     TARGET_GRID = 256
+    if tune:
+        cores = _gfx95_props(device_index)[1]
+        if cores > 0:
+            TARGET_GRID = cores * _GFX95_TARGET_WAVES
     target = max(
         1,
         min(max_topk, TARGET_GRID // max(1, batch_size * num_kv_heads)),
@@ -375,7 +493,21 @@ def flash_decode_with_gqa_share_sparse(
     )
     # launch attention kernel
     grid = (batch_size * NUM_TOPK_CHUNKS, num_kv_heads)
-    _gqa_share_sparse_decode_kernel[grid](
+    kernel = (
+        _gqa_share_sparse_decode_kernel_fixed
+        if tune
+        else _gqa_share_sparse_decode_kernel
+    )
+    extra_kwargs = {}
+    if tune:
+        num_warps, num_stages = _gfx95_stage1_geometry(grid[0] * grid[1], device_index)
+        extra_kwargs = dict(
+            num_warps=num_warps,
+            num_stages=num_stages,
+            KV_CACHE_MODIFIER=".cg",
+            CLAMP_SLOT_GUARD=True,
+        )
+    kernel[grid](
         q,
         sink,
         k_cache,
@@ -420,20 +552,28 @@ def flash_decode_with_gqa_share_sparse(
         BLOCK_SIZE_N=block_size,
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
+        **extra_kwargs,
     )
-    # merge partials into chunk 0
-    merge_grid = (batch_size, num_q_heads)
-    _merge_topk_attn_out_kernel[merge_grid](
-        o_partial,
-        lse_partial,
-        head_dim,
-        o_partial.stride(0),
-        o_partial.stride(1),
-        o_partial.stride(2),
-        o_partial.stride(3),
-        lse_partial.stride(0),
-        lse_partial.stride(1),
-        lse_partial.stride(2),
-        NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
-    )
+    # merge partials into chunk 0.
+    # With a single chunk there is nothing to merge: the merge computes
+    # weights = exp(lse - max(lse)) / sum(...) = 1 over a length-1 axis and
+    # stores o[0] back onto itself, i.e. it is an identity copy. Skipping it
+    # removes one kernel launch (and one round-trip over the whole output) per
+    # sparse layer per decode step; at the served shape (batch 64, 4 kv heads)
+    # TARGET_GRID always yields NUM_TOPK_CHUNKS == 1, so this is every step.
+    if NUM_TOPK_CHUNKS > 1:
+        merge_grid = (batch_size, num_q_heads)
+        _merge_topk_attn_out_kernel[merge_grid](
+            o_partial,
+            lse_partial,
+            head_dim,
+            o_partial.stride(0),
+            o_partial.stride(1),
+            o_partial.stride(2),
+            o_partial.stride(3),
+            lse_partial.stride(0),
+            lse_partial.stride(1),
+            lse_partial.stride(2),
+            NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
+        )
     return o_partial[0].contiguous()
