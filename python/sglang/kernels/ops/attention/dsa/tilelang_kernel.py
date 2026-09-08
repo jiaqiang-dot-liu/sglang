@@ -319,7 +319,7 @@ def sparse_attention_fwd_kernel_v1(
     H_per_block = padded_H if REPLICATE_H == 1 else 64
 
     @T.prim_func
-    def main(
+    def sparse_attn_fwd_v1_kernel(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
@@ -426,7 +426,7 @@ def sparse_attention_fwd_kernel_v1(
             T.copy(acc_o, O_shared)
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
 
-    return main
+    return sparse_attn_fwd_v1_kernel
 
 
 @tilelang.jit(
@@ -500,7 +500,7 @@ def sparse_attention_fwd_kernel_v2(
     H_per_block = padded_H if REPLICATE_H == 1 else 64
 
     @T.prim_func
-    def main(
+    def sparse_attn_fwd_v2_kernel(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
@@ -806,7 +806,7 @@ def sparse_attention_fwd_kernel_v2(
 
                     T.cp_async_barrier_noinc(bar_k_1_ready[0])
 
-    return main
+    return sparse_attn_fwd_v2_kernel
 
 
 @tilelang.jit(
@@ -874,7 +874,7 @@ def sparse_mla_fwd_decode_partial(
     _q_in_shared = inner_iter == 1
 
     @T.prim_func
-    def main(
+    def sparse_mla_decode_partial_kernel(
         Q: T.Tensor(q_shape, dtype),
         KV: T.Tensor(kv_shape, dtype),
         Indices: T.Tensor(indices_shape, indices_dtype),
@@ -984,7 +984,7 @@ def sparse_mla_fwd_decode_partial(
             T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :])
             T.copy(sumexp, Partial_Lse[b_i, s_i, group_i, H0:H1])
 
-    return main
+    return sparse_mla_decode_partial_kernel
 
 
 @tilelang.jit(
@@ -1024,7 +1024,7 @@ def sparse_mla_fwd_decode_combine(
     accum_dtype = T.float32
 
     @T.prim_func
-    def main(
+    def sparse_mla_decode_combine_kernel(
         Partial_O: T.Tensor(partial_o_shape, dtype),
         Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),
         Output: T.Tensor(o_shape, dtype),
@@ -1070,7 +1070,7 @@ def sparse_mla_fwd_decode_combine(
 
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
 
-    return main
+    return sparse_mla_decode_combine_kernel
 
 
 @tilelang.jit(out_idx=[-2, -1], pass_configs=pass_configs)
@@ -1132,7 +1132,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     dtype_bf16 = T.bfloat16
 
     @T.prim_func
-    def main(
+    def sparse_mla_decode_partial_fp8_kernel(
         q_fp8: T.Tensor(q_fp8_shape, fp8_dtype),
         kv_fp8: T.Tensor(kv_fp8_shape, fp8_dtype),
         indices: T.Tensor(idx_shape, T.int32),
@@ -1319,7 +1319,7 @@ def sparse_mla_fwd_decode_partial_fp8(
 
             T.copy(sumexp, partial_lse[b_i, s_i, group_i, H0:H1])
 
-    return main
+    return sparse_mla_decode_partial_fp8_kernel
 
 
 def tilelang_sparse_fwd(
@@ -1673,7 +1673,7 @@ def dpsk_v4_fp8_partial_kernel(
     if is_dual:
 
         @T.prim_func
-        def main(
+        def dpsk_v4_fp8_partial_dual_kernel(
             Q: T.Tensor(q_shape, BF16),  # type: ignore
             K_combined_1: T.Tensor(k1_shape, "uint32"),  # type: ignore
             Indices_1: T.Tensor(indices1_shape, indices_dtype),  # type: ignore
@@ -2020,10 +2020,10 @@ def dpsk_v4_fp8_partial_kernel(
                     # Phase 2 skipped: m_i is still the -2^30
                     T.copy(m_i, Partial_LSE[b_i, s_i, group_i, H0:H1])
 
-        return main
+        return dpsk_v4_fp8_partial_dual_kernel
 
     @T.prim_func
-    def main(
+    def dpsk_v4_fp8_partial_single_kernel(
         Q: T.Tensor(q_shape, BF16),  # type: ignore
         K_combined_1: T.Tensor(k1_shape, "uint32"),  # type: ignore
         Indices_1: T.Tensor(indices1_shape, indices_dtype),  # type: ignore
@@ -2203,7 +2203,7 @@ def dpsk_v4_fp8_partial_kernel(
             T.copy(acc_o_tail, Partial_O[b_i, s_i, group_i, H0:H1, D : D + D_tail])
             T.copy(m_i, Partial_LSE[b_i, s_i, group_i, H0:H1])
 
-    return main
+    return dpsk_v4_fp8_partial_single_kernel
 
 
 @tilelang.jit(
@@ -2262,7 +2262,7 @@ def dpsk_v4_combine_kernel(
     if is_dual:
 
         @T.prim_func
-        def main(
+        def dpsk_v4_combine_dual_kernel(
             Partial_O: T.Tensor([batch, seq_len, n_groups, num_heads, DT], BF16),  # type: ignore
             Partial_LSE: T.Tensor([batch, seq_len, n_groups, num_heads], accum_dtype),  # type: ignore
             Topk_length_1: T.Tensor([batch], INT32),  # type: ignore
@@ -2368,10 +2368,10 @@ def dpsk_v4_combine_kernel(
                 T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
                 T.copy(final_lse, LSE[b_i, s_i, H0:H1])
 
-        return main
+        return dpsk_v4_combine_dual_kernel
 
     @T.prim_func
-    def main(
+    def dpsk_v4_combine_single_kernel(
         Partial_O: T.Tensor([batch, seq_len, n_groups, num_heads, DT], BF16),  # type: ignore
         Partial_LSE: T.Tensor([batch, seq_len, n_groups, num_heads], accum_dtype),  # type: ignore
         Attn_sink: T.Tensor([num_heads], FP32),  # type: ignore
@@ -2448,7 +2448,7 @@ def dpsk_v4_combine_kernel(
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
             T.copy(final_lse, LSE[b_i, s_i, H0:H1])
 
-    return main
+    return dpsk_v4_combine_single_kernel
 
 
 """
