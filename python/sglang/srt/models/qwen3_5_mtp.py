@@ -68,16 +68,23 @@ def _mtp_quant_config(quant_config):
         return None
     if is_npu() and get_spec().speculative_draft_model_quantization is None:
         return None
-    # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in bf16;
-    # every `mtp.*` layer appears under the quantization exclude list. Detect
-    # that and skip quantization here so linear/MoE weight loaders allocate
-    # bf16 shapes (see sgl-project/sglang#23113).
+    # Quark-quantized Qwen3.5 MXFP4 checkpoints vary. Some ship the whole MTP
+    # module in bf16 (every `mtp.*` layer under the quantization exclude list),
+    # but others (e.g. Qwen3.8-2.4T-A95B-Quark-MXFP4) exclude only the dense
+    # sub-modules -- mtp.fc, mtp.layers.0.self_attn.*, mtp.layers.0.mlp.gate,
+    # mtp.layers.0.mlp.shared_expert* -- while still shipping MXFP4-packed
+    # `mtp.layers.*.mlp.experts.*` tensors. Only drop the quant config when the
+    # MTP *experts* are excluded too; otherwise the fused-MoE loader allocates
+    # bf16 [N, hidden] and fails copying the packed uint8 [N, hidden // 2]
+    # checkpoint tensor (see sgl-project/sglang#23113).
     if quant_config and quant_config.get_name() == "quark":
         exclude_layers = getattr(quant_config, "exclude_layers", [])
-        if any(
-            isinstance(layer, str) and layer.startswith("mtp.")
+        mtp_excluded = [
+            layer
             for layer in exclude_layers
-        ):
+            if isinstance(layer, str) and layer.startswith("mtp.")
+        ]
+        if mtp_excluded and any("mlp.experts" in layer for layer in mtp_excluded):
             return None
     return quant_config
 
