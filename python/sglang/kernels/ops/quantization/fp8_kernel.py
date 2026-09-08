@@ -1923,12 +1923,26 @@ if _is_hip:
                 else:
                     _native_dynamic_per_token_quant_fp8(output, input, scale)
             else:
-                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                 if _use_aiter:
+                    # aiter's dynamic_per_tensor_quant zero-initializes the
+                    # scale on device itself: it launches
+                    # initializeScale(scale, 1, 0.0f) before
+                    # data_to_scale_kernel atomicMax-reduces into it (see
+                    # aiter/csrc/kernels/quant_kernels.cu). Pre-zeroing here is
+                    # therefore dead work -- it costs one extra device fill
+                    # kernel (at::FillFunctor) on *every* fp8 linear, i.e. two
+                    # per decoder layer per forward step, which is pure
+                    # launch/dispatch overhead inside the decode CUDA graph.
+                    # Allocate uninitialized and let aiter own the init.
+                    scale = torch.empty(1, device=input.device, dtype=torch.float32)
                     dynamic_per_tensor_quant(output, input, scale)
                 elif _has_vllm:
+                    # vLLM's dynamic_scaled_fp8_quant reduces into scale, so it
+                    # still requires a zeroed accumulator.
+                    scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                     torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
                 else:
+                    scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                     _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
