@@ -157,6 +157,12 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._reuse_output_buffer = self._output_buffer is not None
         del warmup_output
 
+        # The syncs above order work issued before each warmup, not the last
+        # warmup's own. A JIT module that finishes loading mid-capture issues
+        # illegal driver calls on the capturing stream, so drain once more here.
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+
         graph = torch.cuda.CUDAGraph()
 
         graph_ctx: Callable[..., AbstractContextManager]
