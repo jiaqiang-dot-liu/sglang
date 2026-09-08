@@ -864,6 +864,10 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # Kimi-K3 on ROCm: side stream for the KDA [f_a|b]+f_b GEMVs and the MLA
+    # output-gate GEMM (alt-stream slot [2] only). Implied by
+    # SGLANG_ROCM_USE_MULTI_STREAM, which additionally enables slots [0]/[1].
+    SGLANG_K3_ROCM_ALT_STREAM = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.

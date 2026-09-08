@@ -1407,8 +1407,12 @@ class KimiK3DeltaAttention(nn.Module):
         # [q,k,v,g] GEMM on the main stream (graphed decode/verify only).
         # Same SM bound rationale as the MLA gate stream.
         self._bfa_alt_stream = bfa_alt_stream
+        # gfx950, 69-layer graph replay of this projection block at TP8 bf16: the
+        # overlap wins from M=1 through M=128 (1.10x at 64, 1.11x at 96, 1.04x at
+        # 128) and turns negative from M=160 up, where the wide GEMM already fills
+        # the CUs. Same bound as Blackwell; other archs keep 64.
         self._bfa_bs_limit = (
-            (128 if get_platform().is_blackwell else 64)
+            (128 if (get_platform().is_blackwell or _is_hip) else 64)
             if bfa_alt_stream is not None
             else 0
         )
@@ -2808,11 +2812,27 @@ class KimiK3LinearModel(nn.Module):
         # constructed here and threaded down to the layers. Slots:
         #   [0] MoE dual-stream shared-expert tail
         #   [1] DeepseekV2AttentionMLA base internals (forwarded; unused by K3)
-        #   [2] MLA output-gate GEMM, overlaps the attention core
+        #   [2] MLA output-gate GEMM, overlaps the attention core; also the KDA
+        #       [f_a|b] + f_b tiny GEMVs, which overlap the wide fused [q,k,v,g]
+        #       GEMM (see KimiK3DeltaAttention.forward_qkvbfg_fused)
         # (The attn-res bank write no longer needs a stream: it is fused
         # into the agg1 fast kernel, see AttnResidual.forward(write=True).)
-        # Disable on HIP code path.
-        self.alt_streams = None if _is_hip else [torch.cuda.Stream() for _ in range(3)]
+        #
+        # HIP takes slot [2] only. It carries plain GEMM work that already has a
+        # HIP path (kimi_k3_tiny_gemm falls back to F.linear, the MLA gate to
+        # x * sigmoid(gate)), and both users are gated on get_is_capture_mode()
+        # plus a token bound, so the fork/join is recorded inside the decode graph
+        # as on CUDA. Slots [0]/[1] need SGLANG_ROCM_USE_MULTI_STREAM: the MoE
+        # dual-stream tail reaches k3_ar_fusion's symmetric-memory all-reduce,
+        # which has no HIP path.
+        if not _is_hip:
+            self.alt_streams = [torch.cuda.Stream() for _ in range(3)]
+        elif envs.SGLANG_ROCM_USE_MULTI_STREAM.get():
+            self.alt_streams = [torch.cuda.Stream() for _ in range(3)]
+        elif envs.SGLANG_K3_ROCM_ALT_STREAM.get():
+            self.alt_streams = [None, None, torch.cuda.Stream()]
+        else:
+            self.alt_streams = None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
