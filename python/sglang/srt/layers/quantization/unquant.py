@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import weakref
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional
 
@@ -71,6 +72,98 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.tuned_gemm import tgemm
+
+# Preshuffle unquantized BF16 linear weights into aiter's a16w16 B-preshuffle
+# layout at load time, then drive the tuned ASM a16w16 kernels directly.
+#
+# Why: aiter.tuned_gemm.gemm_a16w16() only sets bpreshuffle=True when the B
+# operand carries an ``is_shuffled`` attribute. Nothing in SGLang ever marks an
+# *unquantized* BF16 weight (only the FP8/MXFP4 paths call shuffle_weight), so
+# bpreshuffle is always False. With no tuned CSV entry for the model's shapes
+# the config lookup then falls all the way through to libtype="torch", i.e.
+# F.linear -> hipBLASLt, and the tuned ASM a16w16 kernels are unreachable.
+#
+# Rather than rely on the ``is_shuffled`` attribute surviving the
+# torch.ops.aiter dispatcher boundary (gemm_a16w16 is registered as a custom
+# op via torch_compile_guard, so a Python-level tensor attribute is not a
+# dependable channel), this path records the preshuffle on the *module* and
+# calls aiter.gemm_a16w16_asm() explicitly with bpreshuffle=True.
+#
+# Defaults on whenever SGLANG_USE_AITER=1; set SGLANG_AITER_BF16_PRESHUFFLE=0
+# to disable without giving up the other AITER fused paths.
+_use_aiter_bf16_preshuffle = (
+    _use_aiter and envs.SGLANG_AITER_BF16_PRESHUFFLE.get()
+)
+
+if _use_aiter_bf16_preshuffle:
+    from aiter.jit.utils.chip_info import get_gfx_runtime as _get_gfx
+    from aiter.ops.gemm_op_a16w16 import gemm_a16w16_asm
+
+# Layers whose weight has been converted to the ASM B-preshuffle layout. A
+# WeakSet so a discarded layer does not pin its module; membership, not a
+# per-layer attribute, keeps the flag off the public module surface.
+_aiter_preshuffled_layers: "weakref.WeakSet[torch.nn.Module]" = weakref.WeakSet()
+
+
+def _aiter_bf16_preshuffle_supported(weight: torch.Tensor) -> bool:
+    """Whether ``weight`` can be served by the ASM a16w16 B-preshuffle path.
+
+    Mirrors the constraints aiter itself enforces, so that once a weight is
+    converted the ASM kernel selection can never fail -- ``get_heuristic_kernel``
+    hard-asserts ("not find kernel for bf16gemm~") rather than falling back,
+    and by then the original layout is gone.
+
+    * tuned_gemm's ``bpreshuffle`` default-config branch requires BF16 in,
+      BF16/FP32 out and ``N % 64 == 0 and K % 64 == 0``. It excludes gfx942
+      (which routes to hipBLASLt, not ASM), so require gfx950.
+    * ``get_heuristic_kernel`` requires ``K % 64 == 0`` and a catalog kernel
+      with ``N % tileN == 0``; the gfx950 bf16gemm catalog ships bPreshuffle=1
+      tiles with tileN of 64 and 256, so ``N % 64 == 0`` guarantees a match.
+    * ``shuffle_weight(layout=(16, 16))`` requires ``N % 16 == 0`` and
+      ``K % 32 == 0``, both implied by the ``% 64`` checks above.
+    """
+    if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+        return False
+    if type(weight.data) is not torch.Tensor:
+        return False
+    n, k = weight.shape
+    if n % 64 != 0 or k % 64 != 0:
+        return False
+    try:
+        return _get_gfx() == "gfx950"
+    except Exception:
+        return False
+
+
+def _aiter_bf16_preshuffled_matmul(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run ``x @ layer.weight.T (+ bias)`` through the tuned ASM a16w16 kernel."""
+    x_shape = x.shape
+    x_2d = x if x.dim() == 2 else x.reshape(-1, x_shape[-1])
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+    n = layer.weight.shape[0]
+
+    out_2d = output
+    if out_2d is None:
+        out_2d = torch.empty(x_2d.shape[0], n, dtype=x.dtype, device=x.device)
+
+    gemm_a16w16_asm(
+        x_2d,
+        layer.weight,
+        out_2d,
+        bias,
+        None,  # splitK: let the heuristic choose
+        None,  # kernelName: let the heuristic choose
+        True,  # bpreshuffle
+    )
+    if output is not None or x.dim() == 2:
+        return out_2d
+    return out_2d.view(*x_shape[:-1], n)
 
 
 class Bf16GemmBackend(Enum):
@@ -389,6 +482,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+            return
+
+        if _use_aiter_bf16_preshuffle and layer not in _aiter_preshuffled_layers:
+            if _aiter_bf16_preshuffle_supported(layer.weight):
+                # Shape and dtype are unchanged, so shape-based consumers keep
+                # working; the layout is not, so every read of layer.weight from
+                # here on must go through the ASM path.
+                layer.weight.data = shuffle_weight(layer.weight.data, layout=(16, 16))
+                layer.weight.is_shuffled = True
+                _aiter_preshuffled_layers.add(layer)
 
     def apply(
         self,
@@ -409,6 +512,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        elif layer in _aiter_preshuffled_layers:
+            # Weight is in the ASM B-preshuffle layout; F.linear/tuned_gemm's
+            # torch fallback would silently read it as if it were row-major.
+            return _aiter_bf16_preshuffled_matmul(layer, x, bias)
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
@@ -459,6 +567,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        if layer in _aiter_preshuffled_layers:
+            if x.ndim != 2:
+                raise ValueError(
+                    "caller-owned linear output currently requires a 2D input"
+                )
+            if output.shape != (x.shape[0], layer.weight.shape[0]):
+                raise ValueError(
+                    f"linear output has shape {output.shape}, expected "
+                    f"{(x.shape[0], layer.weight.shape[0])}"
+                )
+            return _aiter_bf16_preshuffled_matmul(layer, x, bias, output=output)
+
         if (
             get_bf16_gemm_backend().is_cutedsl()
             and x.is_cuda
