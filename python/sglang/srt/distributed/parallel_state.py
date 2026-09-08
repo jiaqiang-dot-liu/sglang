@@ -486,20 +486,28 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
-            if is_hip():
-                try:
-                    # Initialize a custom quick all-reduce implementation for AMD
-                    # when rocm >= gfx942. Quick reduce is designed as a
-                    # complement to custom allreduce.
-                    # Based on quickreduce (https://github.com/mk1-project/quickreduce).
-                    if qr_rocm_arch_available():
-                        self.qr_comm = QuickAllReduce(
-                            group=self.cpu_group, device=self.device
-                        )
-                except Exception as e:
-                    logger.warning(f"Failed to initialize QuickAllReduce: {e}")
-        elif self.world_size > 1 and is_hip():
-            logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
+        if is_hip() and self.world_size > 1:
+            try:
+                # Initialize a custom quick all-reduce implementation for AMD
+                # when rocm >= gfx942. Quick reduce is designed as a
+                # complement to custom allreduce.
+                # Based on quickreduce (https://github.com/mk1-project/quickreduce).
+                # Built independently of `use_custom_allreduce`: QuickAllReduce
+                # is a separate kernel family and is itself opt-in via
+                # ROCM_QUICK_REDUCE_QUANTIZATION, so --disable-custom-all-reduce
+                # must not also strip the quick-reduce path away.
+                if qr_rocm_arch_available():
+                    self.qr_comm = QuickAllReduce(
+                        group=self.cpu_group, device=self.device
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to initialize QuickAllReduce: {e}")
+        if self.world_size > 1 and is_hip():
+            logger.info(
+                "[AR] call path: ca=%s qr=%s",
+                self.ca_comm is not None and not getattr(self.ca_comm, "disabled", True),
+                self.qr_comm is not None and not self.qr_comm.disabled,
+            )
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
@@ -921,6 +929,21 @@ class GroupCoordinator:
                 self.pymscclpp_comm is not None
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
+        # QuickAllReduce (ROCm gfx94x/gfx95x) is opt-in: QuickAllReduce stays
+        # `disabled` unless the operator sets ROCM_QUICK_REDUCE_QUANTIZATION to
+        # a non-NONE regime. Previously `ca` was resolved first and, on HIP,
+        # should_custom_ar() returns True for every fully-xGMI-connected buffer
+        # up to _MAX_CAR_SIZE (8-128MB), so `qr` was unreachable for the small
+        # bf16 TP buffers that dominate decode -- the env silently did nothing.
+        # Probe `qr` first; when the env is unset this is a no-op and `ca` is
+        # still chosen, so default behaviour is unchanged.
+        if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            return "qr"
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
@@ -928,12 +951,6 @@ class GroupCoordinator:
             and self.ca_comm.should_custom_ar(input_)
         ):
             return "ca"
-        if (
-            self.qr_comm is not None
-            and not self.qr_comm.disabled
-            and self.qr_comm.should_quick_allreduce(input_)
-        ):
-            return "qr"
         if self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
             return "pymscclpp"
         if (
