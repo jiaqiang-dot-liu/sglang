@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import replace
 from functools import lru_cache
@@ -201,6 +202,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
+
+logger = logging.getLogger(__name__)
 
 if _is_hip:
     # import aiter
@@ -1419,6 +1422,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.TRITON_KERNELS
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+        elif _use_aiter and not moe_runner_backend.is_aiter():
+            # create_weights and process_weights_after_loading already committed
+            # the expert weights to the AITER layout (256-aligned intermediate,
+            # de-interleaved gate/up, is_shuffled tag), and apply() builds an
+            # AiterMoeQuantInfo off the same _use_aiter switch. A pinned
+            # non-AITER runner would receive that quant_info and die in
+            # fused_experts_none_to_triton reading quant_info.use_mxfp8, and
+            # TritonMoeQuantInfo has no MXFP4 member to build instead. The
+            # runner has to follow the layout the weights are actually in.
+            logger.warning(
+                "MXFP4 with SGLANG_USE_AITER=1 requires the AITER MoE runner; "
+                "overriding --moe-runner-backend %s.",
+                moe_runner_backend.value,
+            )
+            moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():
             # MXFP4 hard-codes Swiglu in the AITER kernel path, so the
