@@ -1040,6 +1040,9 @@ class Envs:
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)
+    # Kill switch for the corrected AITER pa_decode_gluon page table. The flat
+    # per-token kv_indices it replaces silently corrupts attention at page_size > 1.
+    SGLANG_AITER_PA5D_DISABLE_PAGE_TABLE_FIX = EnvBool(False)
     # Native FP8 prefill for exact gfx950 Kimi-K3 zero-prefix and absorbed
     # cached-prefix shapes. Validated at 98% GSM8K accuracy.
     SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
