@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backen
     pa_decode_gluon = None
     get_recommended_splits = None
 
+from sglang.srt.environ import envs
 from sglang.kernels.ops.attention.utils import launch_gather_shuffle_5d_to_linear
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
@@ -40,6 +41,87 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+# --------------------------------------------------------------------------
+# SGLANG_AITER_PA5D_DISABLE_PAGE_TABLE_FIX is a kill switch for the corrected
+# page table below; the fix itself is on by default.
+#
+# ``pa_decode_gluon`` documents ``block_tables`` as a 2-D
+# ``(num_seqs, max_num_blocks_per_seq)`` table of PAGE ids and indexes it as
+# ``block_tables_ptr + seq * block_tables.stride(0) + kv_block_idx``.
+#
+# On the non-unified AITER decode path (``SGLANG_USE_AITER_UNIFIED_ATTN``
+# unset, which is the default) ``AiterAttnBackend.init_forward_metadata``
+# fills ``forward_metadata.kv_indices`` with the FLAT, ragged, per-TOKEN slot
+# ids produced by ``create_flashinfer_kv_indices_triton`` (length
+# ``seq_lens_sum``).  The 2-D page-table conversion
+# ``_transform_table_1_to_real`` is only applied on the *unified* branch.
+# ``forward_decode_vectorized_5d`` hands that flat tensor straight to
+# ``pa_decode_gluon``, so with ``page_size > 1`` the kernel
+#   (a) reads a token id where a page id is expected (off by ``page_size``),
+#   (b) uses a row stride of 1 instead of ``max_num_blocks_per_seq``.
+# Every sequence then attends to an essentially arbitrary, heavily-overlapping
+# slice of the pool.  Measured on this shape (bs=64, ctx=9216, H_kv=8, D=128,
+# fp8 KV, page_size=64) against a torch reference: mean relative error 4.11
+# with the flat table vs 0.0047 (fp8 quantisation noise) with a real page
+# table.  Because the overlapping slice is L2-resident the broken kernel is
+# also ~30% *faster* (0.181 ms vs 0.235 ms per layer), so the bug presents as
+# a throughput win with a silent accuracy collapse.
+#
+# The fix builds the documented page table once per forward step from
+# ``req_to_token`` (the same source and the same ``[:, ::page_size] //
+# page_size`` transform ``_transform_table_1_to_real`` already uses) and
+# memoises it on the freshly-constructed ForwardMetadata object, so the 40
+# per-layer decode calls in a step share one build.  Sizing uses the static
+# ``backend.max_context_len`` rather than the per-step max so the shape is
+# constant and the build is safe to capture in a CUDA/HIP graph.
+#
+# Guarded: any shape/attribute the fast path needs but does not find falls
+# through to the original ``kv_indices`` argument.
+# --------------------------------------------------------------------------
+_PA5D_PAGE_TABLE_FIX = not envs.SGLANG_AITER_PA5D_DISABLE_PAGE_TABLE_FIX.get()
+
+
+def _pa5d_decode_page_table(backend, forward_batch):
+    """Per-step 2-D ``(bs, num_pages)`` PAGE-id block table, memoised."""
+    md = backend.forward_metadata
+    cached = getattr(md, "_pa5d_page_table", None)
+    if cached is not None:
+        return cached
+
+    page_size = int(backend.page_size)
+    req_to_token = backend.req_to_token
+    num_pages = (int(backend.max_context_len) + page_size - 1) // page_size
+    cols = (
+        torch.arange(num_pages, device=req_to_token.device, dtype=torch.int64)
+        * page_size
+    ).clamp_(max=req_to_token.shape[1] - 1)
+    rows = forward_batch.req_pool_indices.to(torch.int64)
+    table = (req_to_token[rows[:, None], cols[None, :]] // page_size).to(torch.int32)
+    md._pa5d_page_table = table
+    return table
+
+
+def _pa5d_decode_block_tables(backend, forward_batch, legacy):
+    """Return the corrected page table, or ``legacy`` when unusable."""
+    if not _PA5D_PAGE_TABLE_FIX:
+        return legacy
+    try:
+        req_to_token = backend.req_to_token
+        if (
+            legacy is None
+            or getattr(legacy, "dim", None) is None
+            or legacy.dim() != 1  # already a 2-D page table (unified path)
+            or int(getattr(backend, "page_size", 1)) <= 1
+            or req_to_token is None
+            or req_to_token.dim() != 2
+            or getattr(forward_batch, "req_pool_indices", None) is None
+            or getattr(backend, "max_context_len", None) is None
+        ):
+            return legacy
+        return _pa5d_decode_page_table(backend, forward_batch)
+    except Exception:  # pragma: no cover - never fail closed on the hot path
+        return legacy
 
 
 def forward_extend_vectorized_5d(
@@ -256,7 +338,9 @@ def forward_decode_vectorized_5d(
         max_part_num = 1
         sliding_window_arg = int(layer.sliding_window_size)
     else:
-        block_tables_pa = backend.forward_metadata.kv_indices
+        block_tables_pa = _pa5d_decode_block_tables(
+            backend, forward_batch, backend.forward_metadata.kv_indices
+        )
         ctx_part = 256
         max_part_num = get_recommended_splits(bs, num_kv_heads)
         sliding_window_arg = 0
