@@ -811,6 +811,10 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # Preshuffle unquantized bf16 linear weights into aiter's a16w16 B-preshuffle
+    # layout at load time so the tuned ASM kernels are reachable. gfx950 only,
+    # and only under SGLANG_USE_AITER.
+    SGLANG_AITER_BF16_PRESHUFFLE = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
