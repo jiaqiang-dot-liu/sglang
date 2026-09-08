@@ -124,6 +124,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
+        # The syncs above order work issued before each warmup, not the last
+        # warmup's own. A JIT module that finishes loading mid-capture issues
+        # illegal driver calls on the capturing stream, so drain once more here.
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
