@@ -17,6 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_gfx942_supported
 
 # gfx942/MI300/MI325 stores e4m3fnuz (bias 8);
@@ -68,6 +69,113 @@ SPLITK_HIGH_TOPK_THRESHOLD = 512
 # ============================================================================
 
 
+# ============================================================================
+# Occupancy-driven split-K fallback (gap.kernel.k001_splitk_occupancy)
+# ============================================================================
+# The non-split-K dual-scope decode kernel launches a grid of
+#     (cdiv(h_q, BLOCK_H), total_tokens)
+# workgroups. _prune_dual_scope_configs pins BLOCK_H=16 for h_q <= 64, so on a
+# TP-sharded DSV4 decode (h_q = num_attention_heads / TP = 64 / 4 = 16) the H
+# dimension collapses to a single block and the grid degenerates to just
+# `total_tokens` workgroups. At batch 64 on a 256-CU MI355X that is 64
+# workgroups: 25% CU occupancy, idle by construction, no matter how well the
+# kernel body itself is tuned.
+#
+# The heuristics in _decide_splitk_dual_scope only enable split-K for small
+# batches (<= 8), very large topk (>= 2048), or h_q > 64. A mid-batch /
+# moderate-topk decode (total_tokens=64, h_q=16, total_topk=512) falls through
+# every branch -- note `use_splitk_for_large_topk` tests
+# `total_tokens > 64`, so batch exactly 64 misses it -- and returns 0.
+#
+# This helper is the fallback: when the base grid cannot fill the CU array,
+# split the topk dimension until it can.
+#
+# Env override: SGLANG_DSV4_DECODE_SPLITK
+#     unset / "auto"   -> occupancy-driven factor (default)
+#     "off" / "0"      -> restore previous behaviour (no split-K from here)
+#     "2" / "4" / "8"  -> force that factor for THIS fallback only
+# The override is deliberately scoped to this fallback: shapes the original
+# heuristics already handle, and the force_no_splitk prefill path, are
+# untouched.
+
+
+# The combine stage only implements these factors; any other value raises
+# ValueError at launch time.
+_SUPPORTED_SPLIT_K = (2, 4, 8)
+
+# Each split must keep at least one full BLOCK_N=64 tile of KV work, else the
+# combine kernel plus partial-buffer traffic costs more than the parallelism.
+_MIN_TOPK_PER_SPLIT = 64
+
+_CU_COUNT = None
+_SPLITK_MODE = None
+
+
+def _get_cu_count() -> int:
+    global _CU_COUNT
+    if _CU_COUNT is None:
+        try:
+            _CU_COUNT = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+        except Exception:
+            _CU_COUNT = 256
+    return _CU_COUNT
+
+
+def _get_splitk_mode() -> str:
+    global _SPLITK_MODE
+    if _SPLITK_MODE is None:
+        _SPLITK_MODE = envs.SGLANG_DSV4_DECODE_SPLITK.get().strip().lower()
+    return _SPLITK_MODE
+
+
+def _occupancy_split_k(total_tokens: int, h_q: int, total_topk: int) -> int:
+    """Split-K factor for shapes _decide_splitk_dual_scope would leave at 0.
+
+    Returns 0 (unchanged behaviour) whenever the base grid already fills the CU
+    array or there is too little topk work to split safely.
+    """
+    mode = _get_splitk_mode()
+    if mode in ("off", "0", "false", "disable", "disabled"):
+        return 0
+
+    # Mirror _prune_dual_scope_configs and the split-K kernel config list:
+    # BLOCK_H is pinned to 16 for h_q <= 64.
+    block_h = 16 if h_q <= 64 else 64
+    h_blocks = (h_q + block_h - 1) // block_h
+    base_wgs = h_blocks * max(total_tokens, 1)
+
+    cu_count = _get_cu_count()
+    if base_wgs >= cu_count:
+        return 0  # already saturating the machine
+
+    # Never starve a split of work.
+    max_by_work = total_topk // _MIN_TOPK_PER_SPLIT
+    if max_by_work < _SUPPORTED_SPLIT_K[0]:
+        return 0
+
+    if mode in ("", "auto", "on", "true", "1"):
+        # Smallest factor that covers the CU array.
+        want = (cu_count + base_wgs - 1) // base_wgs
+    else:
+        try:
+            want = int(mode)
+        except ValueError:
+            return 0
+        if want < _SUPPORTED_SPLIT_K[0]:
+            return 0
+
+    want = min(want, max_by_work, _SUPPORTED_SPLIT_K[-1])
+
+    # Round down to a supported factor.
+    chosen = 0
+    for sk in _SUPPORTED_SPLIT_K:
+        if sk <= want:
+            chosen = sk
+    return chosen
+
+
 def _decide_splitk_dual_scope(total_tokens: int, h_q: int, total_topk: int) -> int:
     """Decide the split_k value for dual-scope attention.
 
@@ -100,7 +208,9 @@ def _decide_splitk_dual_scope(total_tokens: int, h_q: int, total_topk: int) -> i
         or use_splitk_for_large_topk
         or use_splitk_for_large_hq
     ):
-        return 0  # No split-K
+        # No hand-tuned branch matched. Fall back to an occupancy check: if the
+        # non-split-K grid cannot fill the CU array, split-K anyway.
+        return _occupancy_split_k(total_tokens, h_q, total_topk)
 
     # Select split_k value based on workload characteristics.
     # Higher topk benefits from more splits; lower topk needs fewer to
