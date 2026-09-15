@@ -17,6 +17,26 @@ from importlib.metadata import entry_points
 
 import torch
 
+# ROCm/HIP builds expose HIP through the same `torch.cuda` namespace, so the
+# very first `torch.cuda.is_available()` call anywhere in the process (below,
+# and in every scheduler/detokenizer/tokenizer-manager subprocess that
+# imports this module, whether via `fork` or `spawn`) is what decides
+# platform detection. By default that call can initialize a real CUDA/HIP
+# context just to answer "is a device available", which is not fork-safe:
+# a process that forks *after* that context is created can hang or crash in
+# the child when it touches CUDA/HIP again (a long-standing upstream
+# PyTorch/ROCm caveat). Ported from vLLM's ROCm Docker images
+# (`docker/Dockerfile.rocm` sets `PYTORCH_NVML_BASED_CUDA_CHECK=1` before any
+# vLLM process starts) so SGLang gets the same fork-safety here at the
+# platform-detection module boundary instead of depending on the container
+# image. `setdefault` so an operator's explicit override always wins, and
+# the check is scoped to ROCm builds (`torch.version.hip`) to leave CUDA
+# behavior untouched, matching vLLM's ROCm-only scoping. Reading
+# `torch.version.hip` is a plain build-time string lookup and does not
+# itself touch a device, so it is safe to check before this env var is set.
+if torch.version.hip is not None:
+    os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
+
 from sglang.srt.environ import envs
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
