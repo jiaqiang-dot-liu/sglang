@@ -3,7 +3,17 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+
+from sglang.srt.utils import is_hip
+
+if is_hip():
+    # The ROCm build of sgl_kernel does not register this op, so the CUDA import
+    # raises AttributeError at warmup; drop the Triton port once it is built on HIP.
+    from sglang.kernels.ops.speculative.ngram_tree_indices import (
+        reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
+    )
+else:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
