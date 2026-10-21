@@ -576,9 +576,9 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
-        self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
-            self.device
-        )
+        self.q_scale = self.k_scale = self.v_scale = torch.tensor(
+            [1.0], dtype=torch.float32
+        ).to(self.device)
 
         self.logits_soft_cap = 0.0
 
@@ -752,18 +752,20 @@ class AiterAttnBackend(AttentionBackend):
             return "auto"
         return "fp8_e4m3"
 
-    @staticmethod
-    def _quantize_q_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Quantize ``q`` to fp8 with its own dynamic per-tensor scale.
+    def _quantize_q_fp8(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize ``q`` to fp8 with the static q scale.
 
         Returns ``(q_fp8, q_descale)``; ``q_descale`` must be passed as the
         attention kernel's ``q_descale``. The KV cache ``k_scale`` is calibrated
-        for K, not q, so it cannot stand in for q's scale. ``q`` is often a
-        strided view into the fused qkv output, and the quant kernel reads its
-        input as contiguous rows.
+        for K, not q, so it cannot stand in for q's scale. The quant kernel
+        saturates, whereas ``.to(fp8)`` turns out-of-range values into NaN on
+        e4m3fnuz. ``q`` is often a strided view into the fused qkv output, and
+        the quant kernel reads its input as contiguous rows.
         """
-        q_fp8, q_descale = scaled_fp8_quant(q.reshape(q.shape[0], -1).contiguous())
-        return q_fp8.view(q.shape), q_descale
+        q_fp8, _ = scaled_fp8_quant(
+            q.reshape(q.shape[0], -1).contiguous(), self.q_scale
+        )
+        return q_fp8.view(q.shape), self.q_scale
 
     def _use_mla_decode_persist_metadata(self) -> bool:
         """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
