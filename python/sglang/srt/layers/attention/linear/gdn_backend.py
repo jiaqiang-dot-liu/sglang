@@ -1351,11 +1351,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            intermediate_state_indices = select_verify_intermediate_state_indices(
-                self.verify_intermediate_state_indices,
-                forward_batch.req_pool_indices,
-                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-                self.req_to_token_pool.size,
+            # `valid` only matters for PP-stable rows; skip its kernel otherwise.
+            intermediate_state_indices = (
+                select_verify_intermediate_state_indices(
+                    self.verify_intermediate_state_indices,
+                    forward_batch.req_pool_indices,
+                    cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                    self.req_to_token_pool.size,
+                )
+                if pp_spec_stable_rows_enabled()
+                else self.verify_intermediate_state_indices
             )
             mamba_pool = self.state_pool
             use_replayssm_fold = (
