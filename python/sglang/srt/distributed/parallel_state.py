@@ -1206,6 +1206,15 @@ class GroupCoordinator:
         # input is the full (pre-reduce) buffer; should_custom_ar bounds its size.
         if not ca_comm.should_custom_ar(input):
             return False
+        # Above SGLANG_AITER_REDUCE_SCATTER_MAX_BYTES, RCCL beats the custom kernel at
+        # four or more ranks (e.g. sequence-parallel prefill activations).
+        max_bytes = envs.SGLANG_AITER_REDUCE_SCATTER_MAX_BYTES.get()
+        if (
+            max_bytes > 0
+            and self.world_size >= 4
+            and input.numel() * input.element_size() > max_bytes
+        ):
+            return False
         # Equal-chunk only: input rows must split evenly into world_size chunks
         # matching the per-rank output rows.
         if input.shape[0] != output.shape[0] * self.world_size:

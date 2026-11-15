@@ -133,6 +133,53 @@ def test_nondeterministic_reduce_scatter_keeps_native_path(monkeypatch):
     coordinator._reduce_scatter_tensor.assert_called_once_with(output, input_)
 
 
+def _aiter_reduce_scatter_coordinator(monkeypatch, world_size):
+    monkeypatch.setattr(parallel_state, "is_hip", lambda: True)
+    monkeypatch.setenv("SGLANG_DP_USE_REDUCE_SCATTER", "1")
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = world_size
+    ca_comm = Mock(disabled=False, _IS_CAPTURING=False)
+    ca_comm.should_custom_ar.return_value = True
+    coordinator.ca_comm = ca_comm
+    return coordinator
+
+
+@pytest.mark.parametrize(
+    "world_size, rows, max_bytes, expect_custom",
+    [
+        # bf16 rows x 4096: 2048 rows is exactly 16 MiB.
+        (8, 2048, None, True),
+        (8, 2056, None, False),
+        (4, 2056, None, False),
+        # Two ranks are never bounded: the custom kernel stays faster there.
+        (2, 2056, None, True),
+        # 0 removes the bound; a smaller bound moves the cutoff.
+        (8, 2056, "0", True),
+        (8, 1024, str(4 << 20), False),
+    ],
+)
+def test_aiter_reduce_scatter_size_bound(
+    monkeypatch, world_size, rows, max_bytes, expect_custom
+):
+    if max_bytes is not None:
+        monkeypatch.setenv("SGLANG_AITER_REDUCE_SCATTER_MAX_BYTES", max_bytes)
+    coordinator = _aiter_reduce_scatter_coordinator(monkeypatch, world_size)
+    input_ = torch.empty((rows, 4096), dtype=torch.bfloat16)
+    output = torch.empty((rows // world_size, 4096), dtype=torch.bfloat16)
+
+    used_custom = coordinator._maybe_aiter_reduce_scatter(output, input_)
+
+    assert used_custom is expect_custom
+    if expect_custom:
+        coordinator.ca_comm.reduce_scatter.assert_called_once_with(
+            input_, output, registered=False
+        )
+    else:
+        coordinator.ca_comm.reduce_scatter.assert_not_called()
+
+
 def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator = parallel_state.GroupCoordinator.__new__(
         parallel_state.GroupCoordinator

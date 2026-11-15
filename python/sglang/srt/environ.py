@@ -1091,6 +1091,11 @@ class Envs:
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
     # explicitly to force on/off on any platform.
     SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
+    # Largest full (pre-reduce) input, in bytes, that the aiter custom reduce-scatter
+    # takes at world size >= 4; larger inputs run on RCCL. On MI355X (bf16, rows x 4096)
+    # RCCL is faster from 16 MiB up (TP8 at 64 MiB: 209 vs 271 us). At TP2 the custom
+    # kernel stays faster at large sizes, so two-rank groups are not bounded. 0 = no bound.
+    SGLANG_AITER_REDUCE_SCATTER_MAX_BYTES = EnvInt(16 << 20)
     # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
     # path, prefill/extend only) to fp8-e4m3 with per-token-group-128 scales:
     # halves the gathered hidden-state bytes over NCCL; the combine
